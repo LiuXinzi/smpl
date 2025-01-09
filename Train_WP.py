@@ -12,41 +12,28 @@ def compute_A(T, J):
     N = T.shape[0]  # Number of vertices
     K = J.shape[0]  # Number of joints
 
-    # Expand T and J to compute pairwise distances
     T_expanded = T.unsqueeze(0).expand(K, N, 3)  # (K, N, 3)
     J_expanded = J.unsqueeze(1).expand(K, N, 3)  # (K, N, 3)
+    distances = torch.norm(T_expanded - J_expanded, dim=2) 
 
-    # Compute Euclidean distance between each vertex and each joint
-    distances = torch.norm(T_expanded - J_expanded, dim=2)  # (K, N)
+    A = 1.0 / (distances + 1e-8)  
 
-    # Compute initial weights as reciprocal of distances
-    A = 1.0 / (distances + 1e-8)  # Avoid division by zero
-
-    # Normalize each row of A to [0, 1]
     A_min = A.min(dim=1, keepdim=True)[0]
     A_max = A.max(dim=1, keepdim=True)[0]
-    A_normalized = (A - A_min) / (A_max - A_min + 1e-8)  # Normalize to [0, 1]
+    A_normalized = (A - A_min) / (A_max - A_min + 1e-8)  
 
-    # Apply ReLU activation (ensure non-negative values)
     A_activated = torch.relu(A_normalized)
 
     return A_activated
 
 def compute_wi(T, J, num=3):
     N, K = T.shape[0], J.shape[0]
-    
-    # 计算距离
+
     distances = torch.norm(T.unsqueeze(1) - J.unsqueeze(0), dim=2)  # (N, K)
-    
-    # 找到最近的关节点索引和对应的距离
     nearest_indices = torch.argsort(distances, dim=1)[:, :num]  # (N, num)
     nearest_distances = distances.gather(1, nearest_indices)  # (N, num)
-    
-    # 距离的倒数加权
     inverse_distances = 1.0 / (nearest_distances + 1e-8)  # (N, num)
     normalized_weights = inverse_distances / inverse_distances.sum(dim=1, keepdim=True)  # (N, num)
-    
-    # 初始化权重矩阵并分配权重
     W_i = torch.zeros((N, K), dtype=torch.float32, device=T.device)  # (N, K)
     W_i.scatter_(1, nearest_indices, normalized_weights)  # 将权重填入对应的位置 (N, K)
     

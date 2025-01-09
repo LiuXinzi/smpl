@@ -75,7 +75,8 @@ def interactive_model_visualization(model):
     app.run_server(debug=True)
 
 def plot_human_structure(skin_points, joint_points=None, joint_labels=None, name='human_structure'):
-    if joint_points!=None:
+    # import ipdb;ipdb.set_trace()
+    if joint_points.any()!=None:
         joint_points=np.array(joint_points)
         fig = plt.figure(figsize=(10, 7))
         ax = fig.add_subplot(111, projection='3d')
@@ -496,19 +497,21 @@ def get_points(model, index_ranges, num_subjects=50, num_poses=200, num_test=20,
 
 
 if __name__ == "__main__":
-    model = STAR(gender='female', num_betas=10)
+    # model = STAR(gender='female', num_betas=10)
     # plot_human_structure(model.v_shaped,model.J)
-    dic={0: (-4, 4),
-        1: (-2, 2),
-        2: (-4, 4),
-        3: (-4, 4),
-        4: (-4, 4),
-        5: (-4, 4),
-        6: (-4, 4),
-        7: (-4, 4),
-        8: (-4, 4),
-        9: (-4, 4)}
-    subjects_skin = get_points(model, dic)
+    data = np.load("C:\\Users\\25983\\Documents\\Medical_LXZ\\smpl\\W_New.npy", allow_pickle=True).item()
+    plot_human_structure(data['sub0']['skin_template'],data["sub0"]['joint_template'])
+    # dic={0: (-4, 4),
+    #     1: (-2, 2),
+    #     2: (-4, 4),
+    #     3: (-4, 4),
+    #     4: (-4, 4),
+    #     5: (-4, 4),
+    #     6: (-4, 4),
+    #     7: (-4, 4),
+    #     8: (-4, 4),
+    #     9: (-4, 4)}
+    # subjects_skin = get_points(model, dic)
 
 
 
