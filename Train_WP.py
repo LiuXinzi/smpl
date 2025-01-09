@@ -209,7 +209,7 @@ neighbor_list = [
 ]
 real_W = data["Test"]["W"]
 
-# Compute shared W_i, A
+# Compute shared W_i, AB
 first_subject = subject_ids[0]
 T = torch.tensor(data[first_subject]['skin_template'], dtype=torch.float32).cuda()
 J = torch.tensor(data[first_subject]['joint_template'], dtype=torch.float32).cuda()

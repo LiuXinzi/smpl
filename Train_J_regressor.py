@@ -127,29 +127,30 @@ def train_J(smpl_skin, smpl_joint, lambda_sum=1.0, lambda_ridge=0.1):
 
 def main():
     smpl_skin = np.load("smpl_skin.npy")     # (n_samples, 6890, 3)
-    with open('joint_center.pkl', 'rb') as file:
-        loads = pickle.load(file)
-        # print(smpl_joint)
-        for key, value in loads.items():
-            if key=='joint_center':
-                smpl_joint=np.array(value)
-    # import ipdb;ipdb.set_trace()
-    # smpl_joint = np.load("smpl_joint.npy")   # (n_samples, 24, 3)
 
-    # J = train_J(smpl_skin[:5000], smpl_joint[:5000], lambda_sum=1., lambda_ridge=0.0000000001)
-    # np.save("J_trained.npy", J)
-    J=np.load("J_trained.npy")
+    ## Centers from Li-san
+    # with open('joint_center.pkl', 'rb') as file:
+    #     loads = pickle.load(file)
+    #     for key, value in loads.items():
+    #         if key=='joint_center':
+    #             smpl_joint=np.array(value)
+
+    smpl_joint = np.load("smpl_joint.npy")   # (n_samples, 24, 3)
+
+    J = train_J(smpl_skin[:5000], smpl_joint[:5000], lambda_sum=1., lambda_ridge=0.0000000001)
+    np.save("J_trained.npy", J)
+
+    # J=np.load("J_trained.npy")
+
     n_samples = smpl_skin.shape[0]
     predicted_joints = np.empty_like(smpl_joint)  # (n_samples, 24, 3)
-
     for i in range(n_samples):
         predicted_joints[i, :, :] = J @ smpl_skin[i, :, :]
     for i in range(1):
         save_more_groups(smpl_skin[:12],smpl_joint[:12],predicted_joints[:12])
-    # errors = predicted_joints[5000:] - smpl_joint[5000:]
-    # # import ipdb;ipdb.set_trace()
-    # mse_loss = np.mean(errors ** 2)
-    # print("Mean Squared Error Loss:", mse_loss)
+    errors = predicted_joints[5000:] - smpl_joint[5000:]
+    mse_loss = np.mean(errors ** 2)
+    print("Mean Squared Error Loss:", mse_loss)
  
 
 if __name__ == "__main__":
