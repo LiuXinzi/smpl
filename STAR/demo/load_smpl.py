@@ -358,17 +358,19 @@ def get_points(model, index_ranges, num_subjects=50, num_poses=200, num_test=20,
             samples[dim] = truncnorm.rvs(a, b, loc=mu, scale=sigma)
 
         model.betas[:] = samples
-
+        b_list=np.array(samples)
         b2=samples[1]
         skin_template = np.array(model.v_shaped)
         joint_template=np.array(model.J)
         # joint_template = j_reg @ skin_template
         skin_list = []
-
+        tp_list=[]
+        
         for pose_id in range(num_poses):
-            pose=np.random.uniform(-0.3, 0.3, size=72)
+            pose=np.random.uniform(-0.25, 0.25, size=72)
             model.pose[:] = pose
             theta[sub_id][pose_id][:]=pose
+            tp_list.append(np.array(model.v_posed))
             points = np.array(model)
             skin_list.append(points)
 
@@ -377,7 +379,9 @@ def get_points(model, index_ranges, num_subjects=50, num_poses=200, num_test=20,
             "skin_template": skin_template,
             "joint_template": joint_template,
             "b2": np.array(b2),
-            "skin": np.array(skin_list)  # (201, 6890, 3)
+            "skin": np.array(skin_list), # (201, 6890, 3)
+            "T_p":np.array(tp_list),
+            "b_l":b_list
         }
     # TEST set
     for sub_id in range(int(num_subjects/10)):
@@ -398,9 +402,8 @@ def get_points(model, index_ranges, num_subjects=50, num_poses=200, num_test=20,
         skin_list = []
 
         for pose_id in range(int(num_poses/10)):
-            pose=np.random.uniform(-0.3, 0.3, size=72)
+            pose=np.random.uniform(-0.25, 0.25, size=72)
             model.pose[:] = pose
-            theta[sub_id][pose_id][:]=pose
             points = np.array(model)
             skin_list.append(points)
 
@@ -424,21 +427,20 @@ def get_points(model, index_ranges, num_subjects=50, num_poses=200, num_test=20,
 
 
 if __name__ == "__main__":
-    # model = STAR(gender='female', num_betas=10)
+    model = STAR(gender='female', num_betas=10)
     # plot_human_structure(model.v_shaped,model.J)
-    data = np.load("C:\\Users\\25983\\Documents\\Medical_LXZ\\smpl\\W_New.npy", allow_pickle=True).item()
-    plot_human_structure(data['sub0']['skin_template'],data["sub0"]['joint_template'])
-    # dic={0: (-4, 4),
-    #     1: (-2, 2),
-    #     2: (-4, 4),
-    #     3: (-4, 4),
-    #     4: (-4, 4),
-    #     5: (-4, 4),
-    #     6: (-4, 4),
-    #     7: (-4, 4),
-    #     8: (-4, 4),
-    #     9: (-4, 4)}
-    # subjects_skin = get_points(model, dic)
+
+    dic={0: (-4, 4),
+        1: (-2, 2),
+        2: (-4, 4),
+        3: (-4, 4),
+        4: (-4, 4),
+        5: (-4, 4),
+        6: (-4, 4),
+        7: (-4, 4),
+        8: (-4, 4),
+        9: (-4, 4)}
+    subjects_skin = get_points(model, dic)
 
 
 

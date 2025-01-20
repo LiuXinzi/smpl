@@ -1,55 +1,46 @@
 import copy
 import os
+import cv2
+import ipdb
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
 import random
 import matplotlib.pyplot as plt
+import torch.nn.functional as F
 def compute_A(T, J):
 
     N = T.shape[0]  # Number of vertices
     K = J.shape[0]  # Number of joints
 
-    # Expand T and J to compute pairwise distances
     T_expanded = T.unsqueeze(0).expand(K, N, 3)  # (K, N, 3)
     J_expanded = J.unsqueeze(1).expand(K, N, 3)  # (K, N, 3)
+    distances = torch.norm(T_expanded - J_expanded, dim=2) 
 
-    # Compute Euclidean distance between each vertex and each joint
-    distances = torch.norm(T_expanded - J_expanded, dim=2)  # (K, N)
+    A = 1.0 / (distances + 1e-8)  
 
-    # Compute initial weights as reciprocal of distances
-    A = 1.0 / (distances + 1e-8)  # Avoid division by zero
-
-    # Normalize each row of A to [0, 1]
     A_min = A.min(dim=1, keepdim=True)[0]
     A_max = A.max(dim=1, keepdim=True)[0]
-    A_normalized = (A - A_min) / (A_max - A_min + 1e-8)  # Normalize to [0, 1]
+    A_normalized = (A - A_min) / (A_max - A_min + 1e-8)  
 
-    # Apply ReLU activation (ensure non-negative values)
     A_activated = torch.relu(A_normalized)
 
     return A_activated
 
 def compute_wi(T, J, num=3):
     N, K = T.shape[0], J.shape[0]
-    
-    # 计算距离
+
     distances = torch.norm(T.unsqueeze(1) - J.unsqueeze(0), dim=2)  # (N, K)
-    
-    # 找到最近的关节点索引和对应的距离
     nearest_indices = torch.argsort(distances, dim=1)[:, :num]  # (N, num)
     nearest_distances = distances.gather(1, nearest_indices)  # (N, num)
-    
-    # 距离的倒数加权
     inverse_distances = 1.0 / (nearest_distances + 1e-8)  # (N, num)
     normalized_weights = inverse_distances / inverse_distances.sum(dim=1, keepdim=True)  # (N, num)
-    
-    # 初始化权重矩阵并分配权重
     W_i = torch.zeros((N, K), dtype=torch.float32, device=T.device)  # (N, K)
     W_i.scatter_(1, nearest_indices, normalized_weights)  # 将权重填入对应的位置 (N, K)
     
     return W_i
+
 
 def theta_to_q(theta):
     # theta: Tensor of shape (K, 3)
@@ -61,41 +52,85 @@ def theta_to_q(theta):
     q[:, 1:] = half_theta * (sin_half_theta.unsqueeze(-1) / (torch.norm(half_theta, dim=1, keepdim=True) + 1e-8))
     return q
 
+
+
 class SMPLModel(nn.Module):
     def __init__(self, W_i, A_init, K, neighbor_list, N):
         super(SMPLModel, self).__init__()
         self.W_i = W_i.clone().detach()  # Precomputed initial blend weights (N, K)
-        self.W = nn.Parameter((torch.rand(W_i.shape, dtype=torch.float32) * 0.5).cuda())  # Blend weights (N, K)
+        self.W_prime = nn.Parameter((torch.rand(W_i.shape, dtype=torch.float32) * 0.5).cuda())  # Blend weights (N, K)
         self.A = nn.ParameterList([nn.Parameter(A_init[i].cuda()) for i in range(K-1)])  # Activation weights
         self.K = nn.ParameterList([nn.Parameter(torch.rand(len(neighbor_list[i]) * 4 + 1, 3 * N, dtype=torch.float32).cuda()) for i in range(K-1)])  # Correction matrices
         self.neighbor_list = neighbor_list
+        self.K_tree=np.array([[4294967295,          0,          0,          0,          1,
+                 2,          3,          4,          5,          6,
+                 7,          8,          9,          9,          9,
+                12,         13,         14,         16,         17,
+                18,         19,         20,         21],
+       [         0,          1,          2,          3,          4,
+                 5,          6,          7,          8,          9,
+                10,         11,         12,         13,         14,
+                15,         16,         17,         18,         19,
+                20,         21,         22,         23]])
+    def rodrigues(self,pose):
+        """
+        Convert axis-angle representation to rotation matrices.
+        Args:
+            pose: Tensor of shape (K, 3)
+        Returns:
+            R: Tensor of shape (K, 3, 3)
+        """
+        angle = torch.norm(pose, dim=1, keepdim=True)  # (K, 1)
+        angle = torch.clamp(angle, min=1e-8)  # Avoid division by zero
+        axis = pose / angle  # Normalize axis (K, 3)
 
-    def compute_G(self, theta, J):
-        K, _ = J.shape
-        omega = theta.view(K, 3)  # Reshape theta into (K, 3)
-        theta_norm = torch.norm(omega, dim=1, keepdim=True)  # (K, 1)
+        cos = torch.cos(angle).unsqueeze(-1)  # (K, 1, 1)
+        sin = torch.sin(angle).unsqueeze(-1)  # (K, 1, 1)
 
-        omega_hat = omega / (theta_norm + 1e-8)  # Normalize (K, 3)
-        skew_sym_matrix = torch.zeros((K, 3, 3), device=J.device)
-        skew_sym_matrix[:, 0, 1] = -omega_hat[:, 2]
-        skew_sym_matrix[:, 0, 2] = omega_hat[:, 1]
-        skew_sym_matrix[:, 1, 0] = omega_hat[:, 2]
-        skew_sym_matrix[:, 1, 2] = -omega_hat[:, 0]
-        skew_sym_matrix[:, 2, 0] = -omega_hat[:, 1]
-        skew_sym_matrix[:, 2, 1] = omega_hat[:, 0]
+        # Skew-symmetric cross-product matrix
+        skew = torch.zeros(pose.shape[0], 3, 3, device=pose.device)
+        skew[:, 0, 1] = -axis[:, 2]
+        skew[:, 0, 2] = axis[:, 1]
+        skew[:, 1, 0] = axis[:, 2]
+        skew[:, 1, 2] = -axis[:, 0]
+        skew[:, 2, 0] = -axis[:, 1]
+        skew[:, 2, 1] = axis[:, 0]
 
-        R = (
-            torch.eye(3, device=J.device).unsqueeze(0)  # (1, 3, 3)
-            + torch.sin(theta_norm).unsqueeze(-1) * skew_sym_matrix
-            + (1 - torch.cos(theta_norm).unsqueeze(-1)) * torch.matmul(skew_sym_matrix, skew_sym_matrix)
-        )  # (K, 3, 3)
+        # Rodrigues' rotation formula
+        outer = torch.bmm(axis.unsqueeze(2), axis.unsqueeze(1))  # (K, 3, 3)
+        eye = torch.eye(3, device=pose.device).unsqueeze(0).repeat(pose.shape[0], 1, 1)  # (K, 3, 3)
+        R = cos * eye + (1 - cos) * outer + sin * skew  # (K, 3, 3)
 
-        G = torch.eye(4, device=J.device).repeat(K, 1, 1)  # (K, 4, 4)
-        G[:, :3, :3] = R
-        G[:, :3, 3] = J
+        return R
 
-        return G
-   
+
+    def compute_G(self,pose, J):
+
+        K = J.shape[0]
+        pose=pose.view(K, 3)
+        R = self.rodrigues(pose)  # (K, 3, 3)
+
+        # Initialize local transformation matrices
+        G_local = torch.eye(4, device=pose.device).unsqueeze(0).repeat(K, 1, 1)  # (K, 4, 4)
+        G_local[:, :3, :3] = R
+        G_local[:, :3, 3] = J
+
+        # Recursive computation of global transformations
+        G_global = [G_local[0]]
+        for i in range(1, K):
+            parent_idx = self.K_tree[0, i]
+            if parent_idx == 4294967295:  # Root joint (no parent)
+                G_global.append(G_local[i])
+            else:
+                G_global.append(torch.matmul(G_global[parent_idx], G_local[i]))
+        G_global = torch.stack(G_global, dim=0)  # (K, 4, 4)
+
+        # Center transformations around joints
+        J_h = torch.cat([J, torch.zeros((K, 1), device=J.device)], dim=1).unsqueeze(-1)  # (K, 4, 1)
+        G_centered = G_global - torch.matmul(G_global, J_h)
+
+        return G_centered
+
     def compute_blendP(self, T, theta, beta_2,Preg,N,K):
         # Get q - q*
         q_origin = theta_to_q(theta.view(Preg * K, 3)).view(Preg, K, 4)
@@ -135,17 +170,17 @@ class SMPLModel(nn.Module):
 
     def compute_vertex_transform(self, T, W, G, T_p):
 
-        N, K = W.shape
-        T_corrected = T + T_p  # Add pose blend corrections
-        T_homogeneous = torch.cat([T_corrected, torch.ones((N, 1), device=T.device)], dim=1)  # (N, 4)
+            N, K = W.shape
 
-        # Apply global transformations (G) to vertices (T_homogeneous)
-        transformed = torch.einsum('kij,nj->nki', G, T_homogeneous)[:, :, :3]  # (N, K, 3)
+            T_corrected = T + T_p  # (N, 3)
 
-        # Apply blend weights (W)
-        transformed_vertices = torch.einsum('nk,nkj->nj', W, transformed)  # (N, 3)
+            T_corrected_h = torch.cat([T_corrected, torch.ones((N, 1), device=T.device)], dim=1)  # (N, 4)
+            transformed = torch.einsum('kij,nj->nki', G, T_corrected_h)[:, :, :3]  # (N, K, 3)
+            transformed_vertices = torch.einsum('nk,nkj->nj', W, transformed)  # (N, 3)
 
-        return transformed_vertices
+            return transformed_vertices
+
+
 
     def forward(self, V, T, J, theta, beta_2):
 
@@ -153,19 +188,19 @@ class SMPLModel(nn.Module):
         K = J.shape[1]
 
         # Convert theta to quaternion and compute q_neighbors and q_star_neighbors
-
+        W_normalized = F.softmax(self.W_prime, dim=1)
         G_prime = torch.stack([self.compute_G(theta[p], J[p]) for p in range(Preg)])  # (Preg, K, 4, 4)
 
         T_p = self.compute_blendP(T, theta, beta_2,Preg,N,K)  # Pose blend correction
 
         transformed_vertices = torch.stack([
-            self.compute_vertex_transform(T[p], self.W, G_prime[p], T_p[p]) for p in range(Preg)
+            self.compute_vertex_transform(T[p], W_normalized, G_prime[p], T_p[p]) for p in range(Preg)
         ])
 
         # Compute losses
         E_D = torch.sum((V - transformed_vertices) ** 2)
-        E_Wi = torch.norm(self.W - self.W_i) ** 2
-        E_W = torch.norm(self.W, p=1)
+        E_Wi = torch.norm(W_normalized - self.W_i) ** 2
+        E_W = torch.norm(W_normalized, p=1)
         E_A = sum(torch.norm(A_j, p=1) for A_j in self.A)
         E_K = sum(torch.norm(K_j) for K_j in self.K)
 
@@ -175,8 +210,8 @@ class SMPLModel(nn.Module):
         return E, transformed_vertices
 
 # load data
-data = np.load("W_new.npy", allow_pickle=True).item()
-data_dir = 'result/test'
+data = np.load("W3.npy", allow_pickle=True).item()
+data_dir = 'result/test_theta2'
 if not os.path.exists(data_dir): 
     os.makedirs(data_dir)
 all_keys = data.keys()
@@ -219,8 +254,8 @@ neighbor_list = [
     [21,23], # 23
 ]
 real_W = data["Test"]["W"]
-
-# Compute shared W_i, A
+real_theta = data["Test"]["theta"]
+# Compute shared W_i, AB
 first_subject = subject_ids[0]
 T = torch.tensor(data[first_subject]['skin_template'], dtype=torch.float32).cuda()
 J = torch.tensor(data[first_subject]['joint_template'], dtype=torch.float32).cuda()
@@ -231,7 +266,7 @@ A_init = compute_A(T, J)  # Compute A
 model = SMPLModel(W_i,A_init[1:], K, neighbor_list, N).cuda()
 all_theta = nn.Parameter((torch.randn(Psub, Preg, K * 3, dtype=torch.float32) * 0.1).cuda())
 optimizer_theta = optim.Adam([all_theta], lr=1e-3)
-optimizer_W = optim.Adam([model.W], lr=1e-3)
+optimizer_W = optim.Adam([model.W_prime], lr=1e-3)
 optimizer_AK = optim.Adam([*model.A.parameters(), *model.K.parameters()], lr=1e-3)
 
 # save
@@ -268,7 +303,7 @@ for epoch in range(1000000):
 
     model.eval()
     with torch.no_grad():
-        W_copy = model.W.clone().detach().cpu().numpy()
+        W_copy = F.softmax(model.W_prime.clone(), dim=1).detach().cpu().numpy()
         MAE=np.mean(np.abs(W_copy- real_W))
         MAX=np.max(np.abs(W_copy- real_W))
         
@@ -280,7 +315,8 @@ for epoch in range(1000000):
         # print(f"W_MAE: {MAE}, W_MAX: {MAX}, Best_E: {best_epoch}")
 
     # train fig each 2000 epoch
-    if epoch % 2000 == 0:
+    if epoch % 500 == 0:
+        np.save(f"{data_dir}/theta.npz",all_theta.clone().detach().cpu().numpy())
         fig, axes = plt.subplots(4, 5, figsize=(20, 16))
         axes = axes.flatten()
         for i, test_subject_id in enumerate(subject_id_without_shuffle[:20]):
@@ -291,7 +327,7 @@ for epoch in range(1000000):
             beta_2_test = torch.tensor(test_data['b2'], dtype=torch.float32).cuda()
 
             theta_test = all_theta[subject_ids.index(test_subject_id), 0:1]  # Corresponding theta
-
+            print(theta_test)
             with torch.no_grad():
                 _,predicted_V = model(V_test, T_test, J_test, theta_test, beta_2_test)
                 error = torch.mean((V_test - predicted_V) ** 2).item()

@@ -2,6 +2,7 @@ import numpy as np
 import ipdb
 import matplotlib.pyplot as plt
 import numpy as np
+import torch
 
 def plot_human_structure(skin_points, joint_points=None, joint_labels=None, name='human_structure'):
     # import ipdb;ipdb.set_trace()
@@ -56,7 +57,7 @@ def plot_human_structure(skin_points, joint_points=None, joint_labels=None, name
 def visualize_matrix(matrix,name=''):
     # visualize_matrix(J_T,'w_nnsum1')
     plt.figure(figsize=(5, 25)) 
-    plt.imshow(matrix, aspect='auto', cmap='viridis', interpolation='nearest')
+    plt.imshow(matrix, aspect='auto', cmap='viridis', interpolation='nearest', vmin=0, vmax=1) 
     plt.colorbar(label="Value") 
     plt.title("Heatmap of 24x6890 Matrix")
     plt.xlabel("Columns")
@@ -64,7 +65,11 @@ def visualize_matrix(matrix,name=''):
     plt.savefig(f"{name}.png") 
 
 
-J_T = np.load('result\\W_nnsum1\\W.npy')
-visualize_matrix(J_T,'w_nnsum1')
+J_T = np.load('W.npy',allow_pickle=True).item()["Test"]["W"]
+J_Train=np.load("C:\\Users\\25983\\Documents\\Medical_LXZ\\smpl\\result\\thetaisright\WAK.npz.npy",allow_pickle=True).item()["W"]
+J_ini=np.load("Wi.npy",allow_pickle=True)
+
+visualize_matrix(abs(J_T-J_Train),'WP_train_difference')
+# import ipdb;ipdb.set_trace()
 
 

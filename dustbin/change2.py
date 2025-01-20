@@ -5,86 +5,147 @@ import torch.nn as nn
 import torch.optim as optim
 import numpy as np
 import random
+import ipdb
 import matplotlib.pyplot as plt
 import torch.nn.functional as F
 def compute_A(T, J):
-
     N = T.shape[0]  # Number of vertices
     K = J.shape[0]  # Number of joints
-
     T_expanded = T.unsqueeze(0).expand(K, N, 3)  # (K, N, 3)
     J_expanded = J.unsqueeze(1).expand(K, N, 3)  # (K, N, 3)
     distances = torch.norm(T_expanded - J_expanded, dim=2) 
-
     A = 1.0 / (distances + 1e-8)  
-
     A_min = A.min(dim=1, keepdim=True)[0]
     A_max = A.max(dim=1, keepdim=True)[0]
     A_normalized = (A - A_min) / (A_max - A_min + 1e-8)  
-
     A_activated = torch.relu(A_normalized)
 
     return A_activated
 
-def compute_wi(T, J, num=3):
-    N, K = T.shape[0], J.shape[0]
+def annealing_factor(epoch, init_factor, decay_rate=5e-5):
+    return init_factor * np.exp(-decay_rate * epoch)
 
+def cosine_decay_lr(epoch, max_lr, total_epochs):
+    return max_lr * 0.5 * (1 + np.cos(np.pi * epoch / total_epochs))
+
+
+def compute_wi(T, J, num=4):
+    N, K = T.shape[0], J.shape[0]
     distances = torch.norm(T.unsqueeze(1) - J.unsqueeze(0), dim=2)  # (N, K)
     nearest_indices = torch.argsort(distances, dim=1)[:, :num]  # (N, num)
     nearest_distances = distances.gather(1, nearest_indices)  # (N, num)
     inverse_distances = 1.0 / (nearest_distances + 1e-8)  # (N, num)
     normalized_weights = inverse_distances / inverse_distances.sum(dim=1, keepdim=True)  # (N, num)
     W_i = torch.zeros((N, K), dtype=torch.float32, device=T.device)  # (N, K)
-    W_i.scatter_(1, nearest_indices, normalized_weights)  # 将权重填入对应的位置 (N, K)
+    W_i.scatter_(1, nearest_indices, normalized_weights)
     
     return W_i
 
 
 def theta_to_q(theta):
-    # theta: Tensor of shape (K, 3)
+
     K = theta.size(0)
+    angle = torch.norm(theta, dim=1, keepdim=True)  # Norm of axis-angle vector (K, 1)
+    angle = torch.clamp(angle, min=1e-8)  # Avoid division by zero for small angles
+    axis = theta / angle  # Normalize axis (K, 3)
+
+    half_angle = angle / 2
     q = torch.zeros(K, 4, device=theta.device)  # Quaternion (w, x, y, z)
-    half_theta = theta / 2
-    q[:, 0] = torch.cos(torch.norm(half_theta, dim=1))  # w
-    sin_half_theta = torch.sin(torch.norm(half_theta, dim=1))
-    q[:, 1:] = half_theta * (sin_half_theta.unsqueeze(-1) / (torch.norm(half_theta, dim=1, keepdim=True) + 1e-8))
+    q[:, 0] = torch.cos(half_angle.squeeze())  # w = cos(half_angle)
+    q[:, 1:] = axis * torch.sin(half_angle)  # (x, y, z) = sin(half_angle) * normalized_axis
+
     return q
+
+
+def save_model_params(model, save_path="WAK.npy"):
+
+    W_clone = model.W_prime.clone().detach().cpu().numpy()
+    A_clone = [a.clone().detach().cpu().numpy() for a in model.A]
+    K_clone = [k.clone().detach().cpu().numpy() for k in model.K]
+
+    param_dict = {
+        "W": W_clone,
+        "A": A_clone,
+        "K": K_clone
+    }
+
+    np.save(save_path, param_dict)
+
+def update_lr(optimizer, new_lr):
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = new_lr
 
 class SMPLModel(nn.Module):
     def __init__(self, W_i, A_init, K, neighbor_list, N):
         super(SMPLModel, self).__init__()
         self.W_i = W_i.clone().detach()  # Precomputed initial blend weights (N, K)
-        self.W_prime = nn.Parameter((torch.rand(W_i.shape, dtype=torch.float32) * 0.5).cuda())  # Blend weights (N, K)
-        self.A = nn.ParameterList([nn.Parameter(A_init[i].cuda()) for i in range(K-1)])  # Activation weights
-        self.K = nn.ParameterList([nn.Parameter(torch.rand(len(neighbor_list[i]) * 4 + 1, 3 * N, dtype=torch.float32).cuda()) for i in range(K-1)])  # Correction matrices
+        self.W_prime = nn.Parameter(W_i.clone().cuda())  # Blend weights (N, K)
+        self.A = nn.ParameterList([nn.Parameter(A_init[i].clone().cuda()) for i in range(K-1)])  # Activation weights
+        self.K = nn.ParameterList([nn.Parameter(torch.normal(0, 0.5, size=(len(neighbor_list[i]) * 4 + 1, 3 * N)).cuda()) for i in range(K-1)])
         self.neighbor_list = neighbor_list
+        self.K_tree=np.array([[4294967295,          0,          0,          0,          1,
+                 2,          3,          4,          5,          6,
+                 7,          8,          9,          9,          9,
+                12,         13,         14,         16,         17,
+                18,         19,         20,         21],
+       [         0,          1,          2,          3,          4,
+                 5,          6,          7,          8,          9,
+                10,         11,         12,         13,         14,
+                15,         16,         17,         18,         19,
+                20,         21,         22,         23]])
+    def rodrigues(self,pose):
 
-    def compute_G(self, theta, J):
-        K, _ = J.shape
-        omega = theta.view(K, 3)  # Reshape theta into (K, 3)
-        theta_norm = torch.norm(omega, dim=1, keepdim=True)  # (K, 1)
+        angle = torch.norm(pose, dim=1, keepdim=True)  # (K, 1)
+        angle = torch.clamp(angle, min=1e-8)  # Avoid division by zero
+        axis = pose / angle  # Normalize axis (K, 3)
 
-        omega_hat = omega / (theta_norm + 1e-8)  # Normalize (K, 3)
-        skew_sym_matrix = torch.zeros((K, 3, 3), device=J.device)
-        skew_sym_matrix[:, 0, 1] = -omega_hat[:, 2]
-        skew_sym_matrix[:, 0, 2] = omega_hat[:, 1]
-        skew_sym_matrix[:, 1, 0] = omega_hat[:, 2]
-        skew_sym_matrix[:, 1, 2] = -omega_hat[:, 0]
-        skew_sym_matrix[:, 2, 0] = -omega_hat[:, 1]
-        skew_sym_matrix[:, 2, 1] = omega_hat[:, 0]
+        cos = torch.cos(angle).unsqueeze(-1)  # (K, 1, 1)
+        sin = torch.sin(angle).unsqueeze(-1)  # (K, 1, 1)
 
-        R = (
-            torch.eye(3, device=J.device).unsqueeze(0)  # (1, 3, 3)
-            + torch.sin(theta_norm).unsqueeze(-1) * skew_sym_matrix
-            + (1 - torch.cos(theta_norm).unsqueeze(-1)) * torch.matmul(skew_sym_matrix, skew_sym_matrix)
-        )  # (K, 3, 3)
+        # Skew-symmetric cross-product matrix
+        skew = torch.zeros(pose.shape[0], 3, 3, device=pose.device)
+        skew[:, 0, 1] = -axis[:, 2]
+        skew[:, 0, 2] = axis[:, 1]
+        skew[:, 1, 0] = axis[:, 2]
+        skew[:, 1, 2] = -axis[:, 0]
+        skew[:, 2, 0] = -axis[:, 1]
+        skew[:, 2, 1] = axis[:, 0]
 
-        G = torch.eye(4, device=J.device).repeat(K, 1, 1)  # (K, 4, 4)
-        G[:, :3, :3] = R
-        G[:, :3, 3] = J
+        # Rodrigues' rotation formula
+        outer = torch.bmm(axis.unsqueeze(2), axis.unsqueeze(1))  # (K, 3, 3)
+        eye = torch.eye(3, device=pose.device).unsqueeze(0).repeat(pose.shape[0], 1, 1)  # (K, 3, 3)
+        R = cos * eye + (1 - cos) * outer + sin * skew  # (K, 3, 3)
 
-        return G
-   
+        return R
+
+
+    def compute_G(self,pose, J):
+
+        K = J.shape[0]
+        pose=pose.view(K, 3)
+        R = self.rodrigues(pose)  # (K, 3, 3)
+
+        # Initialize local transformation matrices
+        G_local = torch.eye(4, device=pose.device).unsqueeze(0).repeat(K, 1, 1)  # (K, 4, 4)
+        G_local[:, :3, :3] = R
+        G_local[:, :3, 3] = J
+
+        # Recursive computation of global transformations
+        G_global = [G_local[0]]
+        for i in range(1, K):
+            parent_idx = self.K_tree[0, i]
+            if parent_idx == 4294967295:  # Root joint (no parent)
+                G_global.append(G_local[i])
+            else:
+                G_global.append(torch.matmul(G_global[parent_idx], G_local[i]))
+        G_global = torch.stack(G_global, dim=0)  # (K, 4, 4)
+
+        # Center transformations around joints
+        J_h = torch.cat([J, torch.zeros((K, 1), device=J.device)], dim=1).unsqueeze(-1)  # (K, 4, 1)
+        G_centered = G_global - torch.matmul(G_global, J_h)
+
+        return G_centered
+
     def compute_blendP(self, T, theta, beta_2,Preg,N,K):
         # Get q - q*
         q_origin = theta_to_q(theta.view(Preg * K, 3)).view(Preg, K, 4)
@@ -124,19 +185,19 @@ class SMPLModel(nn.Module):
 
     def compute_vertex_transform(self, T, W, G, T_p):
 
-        N, K = W.shape
-        T_corrected = T + T_p  # Add pose blend corrections
-        T_homogeneous = torch.cat([T_corrected, torch.ones((N, 1), device=T.device)], dim=1)  # (N, 4)
+            N, K = W.shape
 
-        # Apply global transformations (G) to vertices (T_homogeneous)
-        transformed = torch.einsum('kij,nj->nki', G, T_homogeneous)[:, :, :3]  # (N, K, 3)
+            T_corrected = T + T_p  # (N, 3)
 
-        # Apply blend weights (W)
-        transformed_vertices = torch.einsum('nk,nkj->nj', W, transformed)  # (N, 3)
+            T_corrected_h = torch.cat([T_corrected, torch.ones((N, 1), device=T.device)], dim=1)  # (N, 4)
+            transformed = torch.einsum('kij,nj->nki', G, T_corrected_h)[:, :, :3]  # (N, K, 3)
+            transformed_vertices = torch.einsum('nk,nkj->nj', W, transformed)  # (N, 3)
 
-        return transformed_vertices
+            return transformed_vertices
 
-    def forward(self, V, T, J, theta, beta_2):
+
+
+    def forward(self, V, T, J, theta, beta_2,epoch=1):
 
         Preg, N, _ = V.shape
         K = J.shape[1]
@@ -150,22 +211,30 @@ class SMPLModel(nn.Module):
         transformed_vertices = torch.stack([
             self.compute_vertex_transform(T[p], W_normalized, G_prime[p], T_p[p]) for p in range(Preg)
         ])
-
+        
         # Compute losses
         E_D = torch.sum((V - transformed_vertices) ** 2)
-        E_Wi = torch.norm(W_normalized - self.W_i) ** 2
-        E_W = torch.norm(W_normalized, p=1)
-        E_A = sum(torch.norm(A_j, p=1) for A_j in self.A)
-        E_K = sum(torch.norm(K_j) for K_j in self.K)
+        gamma_Ed = annealing_factor(epoch,1)
 
-        # Total error
-        E = 2.5* E_D + 0.1*E_Wi + 5*E_W + 2.5*E_A + 2.5*E_K  
+        E_Wi = torch.norm(W_normalized - self.W_i) ** 2
+        gamma_Ewi = annealing_factor(epoch,0.01)
+
+        E_W = torch.norm(W_normalized, p=1)
+        gamma_Ew = annealing_factor(epoch,1.)
+
+        E_A = sum(torch.norm(A_j, p=1) for A_j in self.A)
+        gamma_Ea = annealing_factor(epoch,1.)
+
+        E_K = sum(torch.norm(K_j) for K_j in self.K)
+        gamma_Ek = annealing_factor(epoch,1.)
+
+        E = gamma_Ed* E_D + gamma_Ewi*E_Wi + gamma_Ew*E_W + gamma_Ea*E_A + gamma_Ek*E_K  
 
         return E, transformed_vertices
 
 # load data
-data = np.load("W_new.npy", allow_pickle=True).item()
-data_dir = 'result/W_nnsum1'
+data = np.load("W2.npy", allow_pickle=True).item()
+data_dir = 'result/change2'
 if not os.path.exists(data_dir): 
     os.makedirs(data_dir)
 all_keys = data.keys()
@@ -208,7 +277,10 @@ neighbor_list = [
     [21,23], # 23
 ]
 real_W = data["Test"]["W"]
+# real_theta = data["Test"]["theta"]
+# real_theta=torch.from_numpy(real_theta).cuda()
 
+# import ipdb;ipdb.set_trace()
 # Compute shared W_i, AB
 first_subject = subject_ids[0]
 T = torch.tensor(data[first_subject]['skin_template'], dtype=torch.float32).cuda()
@@ -220,6 +292,10 @@ A_init = compute_A(T, J)  # Compute A
 model = SMPLModel(W_i,A_init[1:], K, neighbor_list, N).cuda()
 all_theta = nn.Parameter((torch.randn(Psub, Preg, K * 3, dtype=torch.float32) * 0.1).cuda())
 optimizer_theta = optim.Adam([all_theta], lr=1e-3)
+max_lr_W = 1e-3  # \mathbf{W} 的最大学习率
+max_lr_AK = 1e-3  # \mathbf{A} 和 \mathbf{K} 的最大学习率
+total_epochs = 50000  # 总训练 epoch 数
+
 optimizer_W = optim.Adam([model.W_prime], lr=1e-3)
 optimizer_AK = optim.Adam([*model.A.parameters(), *model.K.parameters()], lr=1e-3)
 
@@ -228,48 +304,60 @@ best_loss=np.inf
 best_epoch= 0
 
 # Training loop
-for epoch in range(1000000):
+for epoch in range(total_epochs):
     # Randomly select a subject
+    def sample_minibatch(subject_data, theta, batch_size=100):
+
+        Preg = subject_data['skin'].shape[0]  # 每个 subject 的注册数量
+
+        # 随机选取 batch_size 个索引
+        indices = torch.randperm(Preg, device=theta.device)[:batch_size]
+
+        # 使用 indices 对数据进行选择，确保梯度不会丢失
+        V_batch = torch.tensor(subject_data['skin'], dtype=torch.float32, device=theta.device)[indices]  # (batch_size, N, 3)
+        T_batch = torch.tensor(subject_data['skin_template'], dtype=torch.float32, device=theta.device).unsqueeze(0).expand(batch_size, -1, -1)  # (batch_size, N, 3)
+        J_batch = torch.tensor(subject_data['joint_template'], dtype=torch.float32, device=theta.device).unsqueeze(0).expand(batch_size, -1, -1)  # (batch_size, K, 3)
+
+        # 对 theta 使用 torch.index_select，保持梯度追踪
+        theta_batch = torch.index_select(theta, 0, indices)  # (batch_size, K, 3)
+
+        return V_batch, T_batch, J_batch, theta_batch
+
+
     subject_id = random.choice(subject_ids) 
     subject_index = subject_ids.index(subject_id)
     subject_data = data[subject_id]
-
-    T = torch.tensor(subject_data['skin_template'], dtype=torch.float32).cuda()
-    J = torch.tensor(subject_data['joint_template'], dtype=torch.float32).cuda()
-    V = torch.tensor(subject_data['skin'], dtype=torch.float32).cuda()  # (200, 6890, 3)
-    beta_2 = torch.tensor(subject_data['b2'], dtype=torch.float32).cuda()
     theta = all_theta[subject_index]
 
-    optimizer_theta.zero_grad()
-    loss_theta , _= model(V, T.unsqueeze(0).repeat(Preg, 1, 1), J.unsqueeze(0).repeat(Preg, 1, 1), theta, beta_2)
-    loss_theta.backward()
-    optimizer_theta.step()
+    V,T,J,theta=sample_minibatch(subject_data,theta)
+
+    beta_2 = torch.tensor(subject_data['b2'], dtype=torch.float32).cuda()
+    
+
+    lr_W = cosine_decay_lr(epoch, max_lr_W, total_epochs)
+    lr_AK = cosine_decay_lr(epoch, max_lr_AK, total_epochs)
+    update_lr(optimizer_W, lr_W)
+    update_lr(optimizer_AK, lr_AK)
+    for i in range(1):
+        optimizer_theta.zero_grad()
+        loss_theta , _= model(V, T, J, theta, beta_2,epoch=epoch)
+        loss_theta.backward()
+        optimizer_theta.step()
 
     optimizer_W.zero_grad()
-    loss_W , _= model(V, T.unsqueeze(0).repeat(Preg, 1, 1), J.unsqueeze(0).repeat(Preg, 1, 1), theta.detach(), beta_2)
-    loss_W.backward()
-    optimizer_W.step()
-
     optimizer_AK.zero_grad()
-    loss_AK ,_= model(V, T.unsqueeze(0).repeat(Preg, 1, 1), J.unsqueeze(0).repeat(Preg, 1, 1), theta.detach(), beta_2)
-    loss_AK.backward()
+
+    loss , _= model(V, T, J, theta.detach(), beta_2,epoch=epoch)
+    loss.backward()
+
+    optimizer_W.step()
     optimizer_AK.step()
 
     model.eval()
-    with torch.no_grad():
-        W_copy = F.softmax(model.W_prime.clone(), dim=1).detach().cpu().numpy()
-        MAE=np.mean(np.abs(W_copy- real_W))
-        MAX=np.max(np.abs(W_copy- real_W))
-        
-        if MAE < best_loss:
-            best_loss=MAE
-            best_epoch=epoch
-            np.save(f'{data_dir}/W.npy',W_copy)
 
-        # print(f"W_MAE: {MAE}, W_MAX: {MAX}, Best_E: {best_epoch}")
-
-    # train fig each 2000 epoch
-    if epoch % 2000 == 0:
+    if epoch % 200 == 0:
+        with torch.no_grad():
+            save_model_params(copy.deepcopy(model),save_path=f'{data_dir}/WAK.npz')
         fig, axes = plt.subplots(4, 5, figsize=(20, 16))
         axes = axes.flatten()
         for i, test_subject_id in enumerate(subject_id_without_shuffle[:20]):
@@ -280,8 +368,8 @@ for epoch in range(1000000):
             beta_2_test = torch.tensor(test_data['b2'], dtype=torch.float32).cuda()
 
             theta_test = all_theta[subject_ids.index(test_subject_id), 0:1]  # Corresponding theta
-
             with torch.no_grad():
+
                 _,predicted_V = model(V_test, T_test, J_test, theta_test, beta_2_test)
                 error = torch.mean((V_test - predicted_V) ** 2).item()
                 ax = axes[i]
@@ -291,47 +379,6 @@ for epoch in range(1000000):
                 ax.legend()
         plt.tight_layout()
         plt.savefig(f'{data_dir}/{epoch}.png')
-    
-    # validation
-    if epoch % 10000 == 0 and epoch != 0:
-        with torch.no_grad():
-            copied_model = copy.deepcopy(model)
-        theta_valid = nn.Parameter((torch.randn(5, 20, K * 3, dtype=torch.float32) * 0.1).cuda())
-        optimizer_valid = optim.Adam([theta_valid], lr=1e-3)
-        for valid_epoch in range(5000):
-            print(f'Test_epoch:{valid_epoch}')
-            test_id = random.choice(test_ids)  # Randomly select a subject
-            test_index = test_ids.index(test_id)
-            test_data = data[test_id]
-            T_test = torch.tensor(test_data['skin_template'], dtype=torch.float32).cuda()
-            J_test = torch.tensor(test_data['joint_template'], dtype=torch.float32).cuda()
-            V_test = torch.tensor(test_data['skin'], dtype=torch.float32).cuda()  # (200, 6890, 3)
-            beta_2_test = torch.tensor(test_data['b2'], dtype=torch.float32).cuda()
-            theta_test = theta_valid[test_index]
-            optimizer_valid.zero_grad()
-            loss_test , _= copied_model(V_test, T_test.unsqueeze(0).repeat(20, 1, 1), J_test.unsqueeze(0).repeat(20, 1, 1), theta_test, beta_2_test)
-            loss_test.backward()
-            optimizer_valid.step()
-        fig, axes = plt.subplots(1, 5, figsize=(20, 5))
-        axes = axes.flatten()
-        for i, test_subject_id in enumerate(test_ids[:5]):
-            test_data = data[test_subject_id]
-            T_test = torch.tensor(test_data['skin_template'], dtype=torch.float32).cuda().view(1,6890,3)
-            J_test = torch.tensor(test_data['joint_template'], dtype=torch.float32).cuda().view(1,K,3)
-            V_test = torch.tensor(test_data['skin'][0:1], dtype=torch.float32).cuda().view(1,6890,3)  # First register only
-            beta_2_test = torch.tensor(test_data['b2'], dtype=torch.float32).cuda()
 
-            theta_test = theta_valid[test_ids.index(test_subject_id), 0:1]  # Corresponding theta
-
-            with torch.no_grad():
-                _,predicted_V = copied_model(V_test, T_test, J_test, theta_test, beta_2_test)
-                error = torch.mean((V_test - predicted_V) ** 2).item()
-                ax = axes[i]
-                ax.scatter(V_test[0, :, 0].cpu(), V_test[0, :, 1].cpu(), s=1, label="Ground Truth")
-                ax.scatter(predicted_V[0, :, 0].cpu(), predicted_V[0, :, 1].cpu(), s=1, label="Prediction")
-                ax.set_title(f"Test_Subject {test_subject_id} Error: {error:.4f}")
-                ax.legend()
-        plt.tight_layout()
-        plt.savefig(f'{data_dir}/{epoch}_test.png')
     model.train()
     print(f"Epoch {epoch + 1}")
