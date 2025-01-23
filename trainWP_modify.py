@@ -7,6 +7,7 @@ import numpy as np
 import random
 import ipdb
 import matplotlib.pyplot as plt
+from torch.nn.utils import clip_grad_norm_
 import torch.nn.functional as F
 def compute_A(T, J):
     N = T.shape[0]  # Number of vertices
@@ -22,7 +23,8 @@ def compute_A(T, J):
 
     return A_activated
 
-def annealing_factor(epoch, init_factor, decay_rate=1e-4):
+def annealing_factor(epoch, init_factor, decay_rate=8e-3):
+    print(np.exp(-decay_rate * epoch))
     return init_factor * np.exp(-decay_rate * epoch)
 
 def cosine_decay_lr(epoch, max_lr, total_epochs):
@@ -56,7 +58,27 @@ def theta_to_q(theta):
 
     return q
 
+def axis2quat(p):
 
+    # Compute the rotation angle (norm of axis-angle vector)
+    angle = torch.sqrt(torch.clamp(torch.sum(p**2, dim=1), min=1e-16))  # (N,)
+    
+    # Normalize the axis vector
+    norm_p = p / angle.unsqueeze(-1)  # (N, 3)
+    
+    # Compute the sine and cosine of half the angle
+    cos_angle = torch.cos(angle / 2)  # (N,)
+    sin_angle = torch.sin(angle / 2)  # (N,)
+    
+    # Compute quaternion components
+    qx = norm_p[:, 0] * sin_angle  # x component
+    qy = norm_p[:, 1] * sin_angle  # y component
+    qz = norm_p[:, 2] * sin_angle  # z component
+    qw = cos_angle - 1             # w component (with custom offset)
+    
+    # Combine into a single tensor
+    quat = torch.stack([qx, qy, qz, qw], dim=1)  # Shape (N, 4)
+    return quat
 def save_model_params(model, save_path="WAK.npy"):
    
     W_clone = model.W_prime.clone().detach()
@@ -85,7 +107,7 @@ class SMPLModel(nn.Module):
         self.W_prime = nn.Parameter(W_i.clone().cuda())  # Blend weights (N, K)
         # self.W_prime = nn.Parameter((torch.rand(W_i.shape, dtype=torch.float32) * 0.5).cuda())  # Blend weights (N, K)
         self.A = nn.ParameterList([nn.Parameter(A_init[i].clone().cuda()) for i in range(K-1)])  # Activation weights
-        self.K = nn.ParameterList([nn.Parameter(torch.normal(0, 0.5, size=(len(neighbor_list[i]) * 4 + 1, 3 * N)).cuda()) for i in range(K-1)])
+        self.K = nn.ParameterList([nn.Parameter(torch.normal(0, 0.01, size=(len(neighbor_list[i]) * 4 + 1, 3 * N)).cuda()) for i in range(K-1)])
         self.neighbor_list = neighbor_list
         self.K_tree=np.array([[4294967295, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 9, 9, 12, 13, 14, 16, 17, 18, 19, 20, 21], 
                    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]])
@@ -139,11 +161,10 @@ class SMPLModel(nn.Module):
         return G_global
 
 
-    def compute_blendP(self, T, theta, beta_2,Preg,N,K):
+    def compute_blendP(self, T, q, beta_2,Preg,N,K):
         # Get q - q*
-        q_origin = theta_to_q(theta.view(Preg * K, 3)).view(Preg, K, 4)
-        q_star = theta_to_q(torch.zeros_like(theta.view(Preg * K, 3))).view(Preg, K, 4)
-        q= q_origin-q_star
+        
+    
         T_p = torch.zeros_like(T)  # Initialize blend contribution (Preg, N, 3)
 
         # reshape to Preg, K, 4*K +1
@@ -200,8 +221,9 @@ class SMPLModel(nn.Module):
         W_change = W_relu / (row_sums + 1e-8)             # (N, K)
 
         G_prime = torch.stack([self.compute_G(theta[p], J[p]) for p in range(Preg)])  # (Preg, K, 4, 4)
-
-        # T_p = self.compute_blendP(T, theta, beta_2,Preg,N,K)  # Pose blend correction
+        T_p = torch.zeros_like(T)
+        q = axis2quat(theta.view(Preg * K, 3)).view(Preg, K, 4)
+        T_p = self.compute_blendP(T, q, beta_2,Preg,N,K) +T # Pose blend correction
 
 
         transformed_vertices = torch.stack([
@@ -213,28 +235,27 @@ class SMPLModel(nn.Module):
         gamma_Ed = 1
 
         E_Wi = torch.norm(W_change - self.W_i) ** 2
-        gamma_Ewi = annealing_factor(epoch,1,decay_rate=1e-2)
+        gamma_Ewi = annealing_factor(epoch,0.1,decay_rate=1e-1)
         
         E_W = torch.norm(W_change , p=1)
-        gamma_Ew = annealing_factor(epoch,0.01)
+        gamma_Ew = annealing_factor(epoch,0.002)
         # ipdb.set_trace()
-        # E_A = sum(torch.norm(A_j, p=1) for A_j in self.A)
-        # gamma_Ea = annealing_factor(epoch,1.)
+        E_A = sum(torch.norm(A_j, p=1) for A_j in self.A)
+        gamma_Ea = annealing_factor(epoch,0.001)
 
-        # E_K = sum(torch.norm(K_j) for K_j in self.K)
-        # gamma_Ek = annealing_factor(epoch,0.001)
+        E_K = sum(torch.norm(K_j) for K_j in self.K)
+        gamma_Ek = annealing_factor(epoch,0.1)
         # ipdb.set_trace()
         # E_row_sum = torch.sum(( torch.sum(W_change, dim=1) - 1) ** 2)  # Squared deviation from 1
         # gamma_Ers = annealing_factor(epoch, 0.5)
-        print(f"E_D: {gamma_Ed * E_D:.4f}, E_Wi: {gamma_Ewi *E_Wi:.4f}, E_W: { gamma_Ew *E_W:.4f}")
+        print(f"E_D: {gamma_Ed * E_D:.4f}, E_Wi: {gamma_Ewi *E_Wi:.4f}, E_W: { gamma_Ew *E_W:.4f}, E_A: {gamma_Ea * E_A:.4f}, E_K: { gamma_Ek *E_K:.4f}")
         # Total loss
         E = (
             gamma_Ed * E_D +
             gamma_Ewi * E_Wi +
-            gamma_Ew * E_W 
-            #   +
-            # gamma_Ea * E_A  +
-            # gamma_Ek * E_K 
+            gamma_Ew * E_W  +
+            gamma_Ea * E_A  +
+            gamma_Ek * E_K 
             # + gamma_Ers * E_row_sum # Include the new loss
         )
 
@@ -242,7 +263,7 @@ class SMPLModel(nn.Module):
 
 # load data
 data = np.load("W.npy", allow_pickle=True).item()
-data_dir = 'result/tpisright'
+data_dir = 'result/trainWP_1'
 if not os.path.exists(data_dir): 
     os.makedirs(data_dir)
 all_keys = data.keys()
@@ -301,11 +322,13 @@ model = SMPLModel(W_i,A_init[1:], K, neighbor_list, N).cuda()
 # all_theta = nn.Parameter((torch.randn(Psub, Preg, K * 3, dtype=torch.float32) * 0.1).cuda())
 # optimizer_theta = optim.Adam([all_theta], lr=1e-3)
 max_lr_W = 2e-2  # \mathbf{W} 的最大学习率
-# max_lr_AK = 1e-3  # \mathbf{A} 和 \mathbf{K} 的最大学习率
+max_lr_A = 1e-2  # \mathbf{A} 和 \mathbf{K} 的最大学习率
+max_lr_K = 5e-5  # \mathbf{A} 和 \mathbf{K} 的最大学习率
 total_epochs = 10000  # 总训练 epoch 数
 
 optimizer_W = optim.Adam([model.W_prime])
-# optimizer_AK = optim.Adam([*model.A.parameters(), *model.K.parameters()], lr=1e-3)
+optimizer_A = optim.Adam([*model.A.parameters()])
+optimizer_K = optim.Adam([*model.K.parameters()])
 
 # save
 best_loss=np.inf
@@ -368,9 +391,11 @@ for epoch in range(total_epochs):
     
 
     lr_W = cosine_decay_lr(epoch, max_lr_W, total_epochs)
-    # lr_AK = cosine_decay_lr(epoch, max_lr_AK, total_epochs)
+    lr_A = cosine_decay_lr(epoch, max_lr_A, total_epochs)
+    lr_K = cosine_decay_lr(epoch, max_lr_K, total_epochs)
     update_lr(optimizer_W, lr_W)
-    # update_lr(optimizer_AK, lr_AK)
+    update_lr(optimizer_A, lr_A)
+    update_lr(optimizer_K, lr_K)
 
     # optimizer_theta.zero_grad()
     # loss_theta , _= model(V, T.unsqueeze(0).repeat(Preg, 1, 1), J.unsqueeze(0).repeat(Preg, 1, 1), theta, beta_2)
@@ -378,13 +403,17 @@ for epoch in range(total_epochs):
     # optimizer_theta.step()
 
     optimizer_W.zero_grad()
-    # optimizer_AK.zero_grad()
+    optimizer_A.zero_grad()
+    optimizer_K.zero_grad()
 
     loss , _= model(V, T, J,Tp, theta, beta_2,epoch=epoch)
     loss.backward()
+    clip_grad_norm_(model.K.parameters(), max_norm=10., norm_type=2)
+    clip_grad_norm_(model.K.parameters(), max_norm=2., norm_type=2)
 
     optimizer_W.step()
-    # optimizer_AK.step()
+    optimizer_A.step()
+    optimizer_K.step()
 
     
     print(f"Epoch {epoch + 1}")

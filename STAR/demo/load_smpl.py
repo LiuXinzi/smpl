@@ -422,7 +422,7 @@ def get_points(model, index_ranges, num_subjects=50, num_poses=200, num_test=20,
         }
     # ipdb.set_trace()
     if save:
-        np.save("W_train_dataset.npy", result)
+        np.save("W.npy", result)
     return result
 
 
@@ -440,7 +440,7 @@ if __name__ == "__main__":
         7: (-4, 4),
         8: (-4, 4),
         9: (-4, 4)}
-    subjects_skin = get_points(model, dic)
+    # subjects_skin = get_points(model, dic)
 
 
 

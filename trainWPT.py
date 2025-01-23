@@ -216,13 +216,13 @@ class SMPLModel(nn.Module):
         gamma_Ewi = annealing_factor(epoch,1,decay_rate=1e-2)
         
         E_W = torch.norm(W_change , p=1)
-        gamma_Ew = annealing_factor(epoch,0.01)
+        gamma_Ew = annealing_factor(epoch,0.02)
         # ipdb.set_trace()
         E_A = sum(torch.norm(A_j, p=1) for A_j in self.A)
-        gamma_Ea = annealing_factor(epoch,0.01)
+        gamma_Ea = annealing_factor(epoch,0.015)
 
         E_K = sum(torch.norm(K_j) for K_j in self.K)
-        gamma_Ek = annealing_factor(epoch,0.015)
+        gamma_Ek = annealing_factor(epoch,0.025)
         # ipdb.set_trace()
         # E_row_sum = torch.sum(( torch.sum(W_change, dim=1) - 1) ** 2)  # Squared deviation from 1
         # gamma_Ers = annealing_factor(epoch, 0.5)
@@ -241,7 +241,7 @@ class SMPLModel(nn.Module):
 
 # load data
 data = np.load("W.npy", allow_pickle=True).item()
-data_dir = 'result/thetaisright'
+data_dir = 'result/trainWPT'
 if not os.path.exists(data_dir): 
     os.makedirs(data_dir)
 all_keys = data.keys()
@@ -297,17 +297,18 @@ A_init = compute_A(T, J)  # Compute A
 
 # initial model and optimizer
 model = SMPLModel(W_i,A_init[1:], K, neighbor_list, N).cuda()
-# all_theta = nn.Parameter((torch.randn(Psub, Preg, K * 3, dtype=torch.float32) * 0.1).cuda())
-# optimizer_theta = optim.Adam([all_theta], lr=1e-3)
-max_lr_W = 1e-2  # \mathbf{W} 的最大学习率
-max_lr_A = 5e-3  # \mathbf{A} 和 \mathbf{K} 的最大学习率
-max_lr_K = 5e-4  # \mathbf{A} 和 \mathbf{K} 的最大学习率
+all_theta = nn.Parameter((torch.rand(Psub, Preg, K * 3, dtype=torch.float32) * 0.5 - 0.25).cuda())
+# all_theta = nn.Parameter(real_theta.clone())
+max_lr_W = 2e-2  # \mathbf{W} 的最大学习率
+max_lr_A = 1e-2  # \mathbf{A} 和 \mathbf{K} 的最大学习率
+max_lr_K = 1e-3  # \mathbf{A} 和 \mathbf{K} 的最大学习率
+max_lr_t=1e-4
 total_epochs = 10000  # 总训练 epoch 数
 
 optimizer_W = optim.Adam([model.W_prime])
 optimizer_A = optim.Adam([*model.A.parameters()])
 optimizer_K = optim.Adam([*model.K.parameters()])
-
+optimizer_theta = optim.Adam([all_theta])
 # save
 best_loss=np.inf
 best_epoch= 0
@@ -329,7 +330,7 @@ for epoch in range(total_epochs):
             Tp_test = torch.tensor(test_data['T_p'][0:1], dtype=torch.float32).cuda().view(1,6890,3)  # First register only
             beta_2_test = torch.tensor(test_data['b2'], dtype=torch.float32).cuda()
 
-            theta_test = real_theta[subject_id_without_shuffle.index(test_subject_id), 0:1]  # Corresponding theta
+            theta_test = all_theta[subject_id_without_shuffle.index(test_subject_id), 0:1]  # Corresponding theta
             with torch.no_grad():
                 _,predicted_V = model(V_test, T_test, J_test,Tp_test, theta_test, beta_2_test)
                 error = torch.max((V_test - predicted_V) ** 2).item()
@@ -342,54 +343,89 @@ for epoch in range(total_epochs):
         plt.savefig(f'{data_dir}/{epoch}.png')
 
     model.train()
-    # Randomly select a subject
-    def sample_minibatch(subject_data, theta, batch_size=150):
+    def trainWP():
+        # Randomly select a subject
+        def sample_minibatch(subject_data, theta, batch_size=150):
 
-        Preg = subject_data['skin'].shape[0]  # 每个 subject 的注册数量
-        indices = torch.randperm(Preg)[:batch_size]  # 随机选取 batch_size 个索引
+            Preg = subject_data['skin'].shape[0]  # 每个 subject 的注册数量
+            indices = torch.randperm(Preg)[:batch_size]  # 随机选取 batch_size 个索引
 
-        V_batch = torch.tensor(subject_data['skin'][indices], dtype=torch.float32).cuda()  # (batch_size, N, 3)
-        Tp_t_batch = torch.tensor(subject_data['T_p'][indices], dtype=torch.float32).cuda()  # (batch_size, N, 3)
-        T_batch = torch.tensor(subject_data['skin_template'], dtype=torch.float32).cuda().unsqueeze(0).expand(batch_size, -1, -1)  # (batch_size, N, 3)
-        J_batch = torch.tensor(subject_data['joint_template'], dtype=torch.float32).cuda().unsqueeze(0).expand(batch_size, -1, -1)  # (batch_size, K, 3)
-        theta_batch = theta[indices]  # (batch_size, K, 3)
+            V_batch = torch.tensor(subject_data['skin'][indices], dtype=torch.float32).cuda()  # (batch_size, N, 3)
+            Tp_t_batch = torch.tensor(subject_data['T_p'][indices], dtype=torch.float32).cuda()  # (batch_size, N, 3)
+            T_batch = torch.tensor(subject_data['skin_template'], dtype=torch.float32).cuda().unsqueeze(0).expand(batch_size, -1, -1)  # (batch_size, N, 3)
+            J_batch = torch.tensor(subject_data['joint_template'], dtype=torch.float32).cuda().unsqueeze(0).expand(batch_size, -1, -1)  # (batch_size, K, 3)
+            theta_batch = theta[indices]  # (batch_size, K, 3)
 
-        return V_batch, T_batch, J_batch, Tp_t_batch, theta_batch
+            return V_batch, T_batch, J_batch, Tp_t_batch, theta_batch
 
-    subject_id = random.choice(subject_ids) 
-    
-    subject_index = subject_ids.index(subject_id)
-    subject_data = data[subject_id]
-    theta = real_theta[int(subject_id[3:])]
-    # print(subject_id,int(subject_id[3:]))
-    # ipdb.set_trace()
-    V,T,J,Tp,theta=sample_minibatch(subject_data,theta)
+        subject_id = random.choice(subject_ids) 
 
-    beta_2 = torch.tensor(subject_data['b2'], dtype=torch.float32).cuda()
-    
+        subject_data = data[subject_id]
+        theta = all_theta[int(subject_id[3:])]
+        # print(subject_id,int(subject_id[3:]))
+        # ipdb.set_trace()
+        V,T,J,Tp,theta=sample_minibatch(subject_data,theta)
 
-    lr_W = cosine_decay_lr(epoch, max_lr_W, total_epochs)
-    lr_A = cosine_decay_lr(epoch, max_lr_A, total_epochs)
-    lr_K = cosine_decay_lr(epoch, max_lr_K, total_epochs)
-    update_lr(optimizer_W, lr_W)
-    update_lr(optimizer_A, lr_A)
-    update_lr(optimizer_K, lr_K)
+        beta_2 = torch.tensor(subject_data['b2'], dtype=torch.float32).cuda()
+        
 
-    # optimizer_theta.zero_grad()
-    # loss_theta , _= model(V, T.unsqueeze(0).repeat(Preg, 1, 1), J.unsqueeze(0).repeat(Preg, 1, 1), theta, beta_2)
-    # loss_theta.backward()
-    # optimizer_theta.step()
+        lr_W = cosine_decay_lr(epoch, max_lr_W, total_epochs)
+        lr_A = cosine_decay_lr(epoch, max_lr_A, total_epochs)
+        lr_K = cosine_decay_lr(epoch, max_lr_K, total_epochs)
+        update_lr(optimizer_W, lr_W)
+        update_lr(optimizer_A, lr_A)
+        update_lr(optimizer_K, lr_K)
 
-    optimizer_W.zero_grad()
-    optimizer_A.zero_grad()
-    optimizer_K.zero_grad()
 
-    loss , _= model(V, T, J,Tp, theta, beta_2,epoch=epoch)
-    loss.backward()
+        optimizer_W.zero_grad()
+        optimizer_A.zero_grad()
+        optimizer_K.zero_grad()
 
-    optimizer_W.step()
-    optimizer_A.step()
-    optimizer_K.step()
+        loss , _= model(V, T, J,Tp, theta.detach(), beta_2,epoch=epoch)
+        loss.backward()
+
+        optimizer_W.step()
+        optimizer_A.step()
+        optimizer_K.step()
+
+    def traint():
+        # Randomly select a subject
+        def sample_minibatch(subject_data, theta, batch_size=200):
+
+            Preg = subject_data['skin'].shape[0]  # 每个 subject 的注册数量
+            indices = torch.randperm(Preg)[:batch_size]  # 随机选取 batch_size 个索引
+
+            V_batch = torch.tensor(subject_data['skin'][indices], dtype=torch.float32).cuda()  # (batch_size, N, 3)
+            Tp_t_batch = torch.tensor(subject_data['T_p'][indices], dtype=torch.float32).cuda()  # (batch_size, N, 3)
+            T_batch = torch.tensor(subject_data['skin_template'], dtype=torch.float32).cuda().unsqueeze(0).expand(batch_size, -1, -1)  # (batch_size, N, 3)
+            J_batch = torch.tensor(subject_data['joint_template'], dtype=torch.float32).cuda().unsqueeze(0).expand(batch_size, -1, -1)  # (batch_size, K, 3)
+            theta_batch = theta[indices]  # (batch_size, K, 3)
+
+            return V_batch, T_batch, J_batch, Tp_t_batch, theta_batch
+
+        subject_id = random.choice(subject_ids) 
+        subject_data = data[subject_id]
+        theta = all_theta[int(subject_id[3:])]
+        # print(subject_id,int(subject_id[3:]))
+        # ipdb.set_trace()
+        V,T,J,Tp,theta=sample_minibatch(subject_data,theta)
+
+        beta_2 = torch.tensor(subject_data['b2'], dtype=torch.float32).cuda()
+
+        lr_t = cosine_decay_lr(epoch, max_lr_t, total_epochs)
+
+        update_lr(optimizer_theta, lr_t)
+
+        optimizer_theta.zero_grad()
+
+        loss , _= model(V, T, J,Tp, theta, beta_2,epoch=epoch)
+        loss.backward()
+
+        optimizer_theta.step()
+
+    for i in range(2):
+        traint()
+    trainWP()
 
     
     print(f"Epoch {epoch + 1}")
